@@ -17,7 +17,7 @@
 ## Subcommands
 
 - [`communique completion <SHELL>`](/cli/completion.md)
-- [`communique generate [FLAGS] <TAG> [PREV_TAG]`](/cli/generate.md)
+- [`communique generate [FLAGS] [TAG] [PREV_TAG]`](/cli/generate.md)
 - [`communique publish [--dry-run] <DRAFT>`](/cli/publish.md)
 - [`communique init [--force]`](/cli/init.md)
 - [`communique sponsors`](/cli/sponsors.md)

@@ -9,6 +9,7 @@ use crate::providers::Provider;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
+    pub git: Option<GitConfig>,
     pub system_extra: Option<String>,
     pub context: Option<String>,
     pub defaults: Option<Defaults>,
@@ -16,6 +17,15 @@ pub struct Config {
     pub packages: std::collections::BTreeMap<String, crate::workflow::Package>,
     #[serde(default)]
     pub rules: crate::workflow::Rules,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GitConfig {
+    pub provider: Option<String>,
+    #[allow(dead_code)]
+    pub base_url: Option<String>,
+    #[allow(dead_code)]
+    pub token_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -37,6 +47,12 @@ const TEMPLATE: &str = r#"# Extra instructions appended to the system prompt.
 # Extra context included in every user prompt.
 # Useful for project descriptions or recurring context.
 #context = ""
+
+# Optional GitLab settings for self-hosted installations.
+#[git]
+#provider = "gitlab"
+#base_url = "https://gitlab.example.com"
+#token_env = "GITLAB_TOKEN"
 
 [defaults]
 #model = "claude-opus-5-5"

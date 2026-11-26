@@ -5,7 +5,7 @@ use clx::progress::ProgressJob;
 use log::info;
 
 use crate::error::{Error, Result};
-use crate::github::GitHubClient;
+use crate::git_provider::GitProvider;
 use crate::links;
 use crate::llm::{LlmClient, StopReason, ToolDefinition, ToolResult, Usage};
 use crate::output::{self, ParsedOutput};
@@ -13,6 +13,60 @@ use crate::tools;
 
 const MAX_ITERATIONS: usize = 25;
 const MAX_MALFORMED_SUBMISSIONS: usize = 3;
+
+// Redact credentials that may also occur in repository content before it is
+// sent to a model. Empty values must never be passed to str::replace.
+fn redact_credentials(text: &str, token_env: Option<&str>, origin_secrets: &[String]) -> String {
+    static URL_USERINFO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let text = URL_USERINFO
+        .get_or_init(|| regex::Regex::new(r"(?i)(https?://)[^\s/@]+@").expect("valid URL pattern"))
+        .replace_all(text, "${1}")
+        .into_owned();
+    [
+        "GITLAB_TOKEN",
+        "CI_JOB_TOKEN",
+        "OPENAI_API_KEY",
+        "LLM_API_KEY",
+    ]
+    .into_iter()
+    .chain(token_env)
+    .filter_map(|name| std::env::var(name).ok())
+    .chain(origin_secrets.iter().cloned())
+    .filter(|value| !value.is_empty())
+    .fold(text, |text, value| {
+        let pattern: String = value
+            .chars()
+            .map(|ch| {
+                let encoded: String = ch
+                    .to_string()
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("%{byte:02X}"))
+                    .collect();
+                format!("(?:{}|(?i:{encoded}))", regex::escape(&ch.to_string()))
+            })
+            .collect();
+        match regex::Regex::new(&pattern) {
+            Ok(secret) => secret.replace_all(&text, "[REDACTED]").into_owned(),
+            Err(_) => text.replace(&value, "[REDACTED]"),
+        }
+    })
+}
+
+fn redact_value(value: &mut serde_json::Value, token_env: Option<&str>, origin_secrets: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redact_credentials(text, token_env, origin_secrets)
+        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .for_each(|v| redact_value(v, token_env, origin_secrets)),
+        serde_json::Value::Object(values) => values
+            .values_mut()
+            .for_each(|v| redact_value(v, token_env, origin_secrets)),
+        _ => {}
+    }
+}
 
 fn parse_submission(
     input: &serde_json::Value,
@@ -129,8 +183,10 @@ pub struct AgentContext<'a> {
     pub user_message: &'a str,
     pub tool_defs: Vec<ToolDefinition>,
     pub repo_root: &'a Path,
-    pub github: Option<&'a GitHubClient>,
+    pub github: Option<&'a dyn GitProvider>,
     pub verify_links: bool,
+    pub gitlab_url: Option<&'a str>,
+    pub token_env: Option<&'a str>,
     pub require_release_notes: bool,
     pub require_changelog: bool,
     pub job: &'a Arc<ProgressJob>,
@@ -145,12 +201,36 @@ pub async fn run(ctx: AgentContext<'_>) -> Result<ParsedOutput> {
         repo_root,
         github,
         verify_links,
+        gitlab_url,
+        token_env,
         require_release_notes,
         require_changelog,
         job,
     } = ctx;
 
-    let mut conversation = client.new_conversation(user_message);
+    let mut origin_secrets = Vec::new();
+    if let Some(remote) = xx::git::Git::new(repo_root.to_path_buf()).get_remote_url()
+        && let Ok(url) = reqwest::Url::parse(&remote)
+    {
+        let username = url.username();
+        if !username.is_empty() && !["git", "oauth2", "x-access-token"].contains(&username) {
+            origin_secrets.push(
+                percent_encoding::percent_decode_str(username)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            );
+        }
+        if let Some(password) = url.password() {
+            origin_secrets.push(
+                percent_encoding::percent_decode_str(password)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    let system = redact_credentials(system, token_env, &origin_secrets);
+    let user_message = redact_credentials(user_message, token_env, &origin_secrets);
+    let mut conversation = client.new_conversation(&user_message);
     let mut cache = tools::ToolCache::new();
     let mut total_usage = Usage::default();
     let mut malformed_submission_count = 0;
@@ -164,9 +244,25 @@ pub async fn run(ctx: AgentContext<'_>) -> Result<ParsedOutput> {
             &format!("Thinking... (iteration {})", iteration + 1),
         );
 
-        let response = client
-            .send_turn(system, &mut conversation, &tool_defs)
-            .await?;
+        let mut response = client
+            .send_turn(&system, &mut conversation, &tool_defs)
+            .await
+            .map_err(|error| {
+                Error::Llm(redact_credentials(
+                    &error.to_string(),
+                    token_env,
+                    &origin_secrets,
+                ))
+            })?;
+        for message in &mut conversation.messages {
+            redact_value(message, token_env, &origin_secrets);
+        }
+        for call in &mut response.tool_calls {
+            redact_value(&mut call.input, token_env, &origin_secrets);
+        }
+        if let Some(text) = &mut response.text {
+            *text = redact_credentials(text, token_env, &origin_secrets);
+        }
 
         info!(
             "usage: {} input ({} cache read, {} cache write), {} output tokens",
@@ -211,7 +307,12 @@ pub async fn run(ctx: AgentContext<'_>) -> Result<ParsedOutput> {
         if let Some((tool_call_id, parsed)) = submit {
             if verify_links {
                 job.prop("message", "Verifying links...");
-                let broken = links::verify(&[&parsed.changelog, &parsed.release_body]).await;
+                let broken = links::verify_for_project(
+                    &[&parsed.changelog, &parsed.release_body],
+                    gitlab_url,
+                    github,
+                )
+                .await;
                 if !broken.is_empty() {
                     let summary = broken
                         .iter()
@@ -296,7 +397,10 @@ pub async fn run(ctx: AgentContext<'_>) -> Result<ParsedOutput> {
             .map(|tc| tool_detail(&tc.name, &tc.input))
             .collect();
         for detail in &details {
-            info!("calling tool: {detail}");
+            info!(
+                "calling tool: {}",
+                redact_credentials(detail, token_env, &origin_secrets)
+            );
         }
 
         // Snapshot cache hits before dispatching
@@ -360,6 +464,7 @@ pub async fn run(ctx: AgentContext<'_>) -> Result<ParsedOutput> {
                     match dispatch_iter.next().unwrap() {
                         Ok(output) => {
                             info!("tool {}: {} bytes", tc.name, output.len());
+                            let output = redact_credentials(&output, token_env, &origin_secrets);
                             cache.insert(&tc.name, &tc.input, output.clone());
                             ToolResult {
                                 tool_call_id: tc.id.clone(),
@@ -368,6 +473,7 @@ pub async fn run(ctx: AgentContext<'_>) -> Result<ParsedOutput> {
                             }
                         }
                         Err(e) => {
+                            let e = redact_credentials(&e.to_string(), token_env, &origin_secrets);
                             info!("tool {} error: {e}", tc.name);
                             ToolResult {
                                 tool_call_id: tc.id.clone(),
@@ -477,6 +583,27 @@ mod tests {
     use crate::llm::{StopReason, ToolCall, TurnResponse};
     use crate::test_helpers::{MockLlmClient, fake_usage, submit_tool_call};
 
+    fn default_context<'a>(
+        client: &'a MockLlmClient,
+        repo_root: &'a std::path::Path,
+        job: &'a Arc<clx::progress::ProgressJob>,
+    ) -> AgentContext<'a> {
+        AgentContext {
+            client,
+            system: "",
+            user_message: "",
+            tool_defs: vec![],
+            repo_root,
+            github: None,
+            verify_links: false,
+            gitlab_url: None,
+            token_env: None,
+            require_release_notes: true,
+            require_changelog: true,
+            job,
+        }
+    }
+
     #[test]
     fn test_field_as_string_rejects_empty() {
         let input = json!({ "changelog": "" });
@@ -555,18 +682,7 @@ mod tests {
         }]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.changelog, "log");
         assert_eq!(result.release_title, "v1.0");
@@ -595,6 +711,8 @@ mod tests {
             repo_root: &tmp,
             github: None,
             verify_links: false,
+            gitlab_url: None,
+            token_env: None,
             require_release_notes: false,
             require_changelog: true,
             job: &job,
@@ -627,18 +745,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.changelog, "changes");
         assert_eq!(result.release_title, "v2.0");
@@ -655,18 +762,7 @@ mod tests {
         }]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let err = run(ctx).await.unwrap_err();
         assert!(matches!(err, Error::Llm(_)));
         assert!(err.to_string().contains("without calling"));
@@ -682,18 +778,7 @@ mod tests {
         }]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.release_title, "Cool Release");
         assert_eq!(result.release_body, "Some great changes\n- Added X");
@@ -709,18 +794,7 @@ mod tests {
         }]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let err = run(ctx).await.unwrap_err();
         assert!(matches!(err, Error::Llm(_)));
     }
@@ -743,6 +817,8 @@ mod tests {
             repo_root: &tmp,
             github: None,
             verify_links: false,
+            gitlab_url: None,
+            token_env: None,
             require_release_notes: true,
             require_changelog: false,
             job: &job,
@@ -777,18 +853,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.changelog, "log");
         assert_eq!(result.release_title, "v1.0");
@@ -820,18 +885,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.changelog, "log");
         assert_eq!(result.release_title, "v1.0");
@@ -863,18 +917,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.changelog, "log");
         assert_eq!(result.release_title, "v1.0");
@@ -914,18 +957,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let err = run(ctx).await.unwrap_err();
         assert!(matches!(err, Error::MalformedSubmission { .. }));
     }
@@ -961,18 +993,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let err = run(ctx).await.unwrap_err();
         assert!(
             matches!(err, Error::MalformedSubmission { .. }),
@@ -1040,18 +1061,7 @@ mod tests {
         ]);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let result = run(ctx).await.unwrap();
         assert_eq!(result.changelog, "- Added X\n- Fixed Y");
         assert_eq!(result.release_title, "v2.0");
@@ -1091,6 +1101,8 @@ mod tests {
             repo_root: &tmp,
             github: None,
             verify_links: true,
+            gitlab_url: None,
+            token_env: None,
             require_release_notes: true,
             require_changelog: true,
             job: &job,
@@ -1143,6 +1155,8 @@ mod tests {
             repo_root: &tmp,
             github: None,
             verify_links: true,
+            gitlab_url: None,
+            token_env: None,
             require_release_notes: true,
             require_changelog: true,
             job: &job,
@@ -1168,18 +1182,7 @@ mod tests {
         let client = MockLlmClient::new(responses);
         let job = Arc::new(ProgressJobBuilder::new().build());
         let tmp = std::env::temp_dir();
-        let ctx = AgentContext {
-            client: &client,
-            system: "",
-            user_message: "",
-            tool_defs: vec![],
-            repo_root: &tmp,
-            github: None,
-            verify_links: false,
-            require_release_notes: true,
-            require_changelog: true,
-            job: &job,
-        };
+        let ctx = default_context(&client, &tmp, &job);
         let err = run(ctx).await.unwrap_err();
         assert!(matches!(err, Error::Llm(_)));
         assert!(err.to_string().contains("exceeded"));

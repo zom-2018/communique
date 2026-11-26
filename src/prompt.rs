@@ -155,7 +155,12 @@ pub fn commit_credits_section(credits: &[(String, Vec<String>)]) -> Option<Strin
     ))
 }
 
+#[cfg(test)]
 pub fn user_prompt(ctx: &UserPromptContext) -> String {
+    user_prompt_with_url(ctx, None)
+}
+
+pub fn user_prompt_with_url(ctx: &UserPromptContext, repo_url: Option<&str>) -> String {
     let UserPromptContext {
         tag,
         prev_tag,
@@ -180,9 +185,12 @@ pub fn user_prompt(ctx: &UserPromptContext) -> String {
         format!("Generate release notes for **{tag}** (previous release: {prev_tag}).")
     };
 
+    let repo_url = repo_url
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("https://github.com/{owner_repo}"));
     parts.push(format!(
         "{release_request}\n\
-         Repository: `{owner_repo}` (https://github.com/{owner_repo})\n\n\
+         Repository: `{owner_repo}` ({repo_url})\n\n\
          ## Git Log\n```\n{git_log}\n```"
     ));
 

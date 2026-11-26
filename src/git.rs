@@ -11,31 +11,263 @@ pub fn repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-pub fn detect_remote(repo_root: &Path) -> Result<String> {
-    let git = Git::new(repo_root.to_path_buf());
-    let url = git
-        .get_remote_url()
-        .ok_or_else(|| Error::Git("no origin remote found".into()))?;
-    parse_owner_repo(&url)
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProjectProvider {
+    GitHub,
+    GitLab,
 }
 
-fn parse_owner_repo(url: &str) -> Result<String> {
-    // SSH: git@github.com:owner/repo.git
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let repo = rest.trim_end_matches(".git");
-        return Ok(repo.to_string());
-    }
-    // HTTPS: https://github.com/owner/repo.git
-    if let Some(rest) = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenSource {
+    Environment(String),
+    JobToken,
+}
+
+#[allow(dead_code)] // Fields are consumed by the GitLab API integration in the next step.
+#[derive(Debug)]
+pub struct ProjectIdentity {
+    pub provider: ProjectProvider,
+    pub web_url: String,
+    pub api_url: String,
+    pub path: String,
+    pub project_id: Option<String>,
+    pub token_source: TokenSource,
+}
+
+#[derive(Default)]
+pub struct ProjectEnvironment {
+    pub server_url: Option<String>,
+    pub api_v4_url: Option<String>,
+    pub project_path: Option<String>,
+    pub project_id: Option<String>,
+    pub gitlab_token_available: bool,
+    pub job_token_available: bool,
+}
+
+/// Identify the project without retaining credentials from remote URLs or environment values.
+pub fn detect_project(
+    repo_root: &Path,
+    repo: Option<&str>,
+    config: Option<&crate::config::GitConfig>,
+) -> Result<ProjectIdentity> {
+    let env = ProjectEnvironment {
+        server_url: std::env::var("CI_SERVER_URL").ok(),
+        api_v4_url: std::env::var("CI_API_V4_URL").ok(),
+        project_path: std::env::var("CI_PROJECT_PATH").ok(),
+        project_id: std::env::var("CI_PROJECT_ID").ok(),
+        gitlab_token_available: std::env::var("GITLAB_TOKEN").is_ok_and(|s| !s.is_empty()),
+        job_token_available: std::env::var("CI_JOB_TOKEN").is_ok_and(|s| !s.is_empty()),
+    };
+    let remote = Git::new(repo_root.to_path_buf()).get_remote_url();
+    resolve_project(remote.as_deref(), repo, config, &env)
+}
+
+fn clean_web_url(value: &str) -> Result<String> {
+    let mut url =
+        reqwest::Url::parse(value).map_err(|_| Error::Config("invalid git server URL".into()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        let repo = rest.trim_end_matches(".git");
-        return Ok(repo.to_string());
+        return Err(Error::Config("invalid git server URL".into()));
     }
-    Err(Error::Git(format!(
-        "cannot parse GitHub repo from remote URL: {url}"
-    )))
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&path);
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+fn remote_parts(remote: &str) -> Option<(String, String)> {
+    if remote.contains("://") {
+        let url = reqwest::Url::parse(remote).ok()?;
+        let host = url.host_str()?;
+        let scheme = if url.scheme() == "ssh" {
+            "https"
+        } else {
+            url.scheme()
+        };
+        if !matches!(scheme, "http" | "https") {
+            return None;
+        }
+        let port = if url.scheme() == "ssh" {
+            String::new()
+        } else {
+            url.port().map(|p| format!(":{p}")).unwrap_or_default()
+        };
+        Some((
+            format!("{scheme}://{host}{port}"),
+            url.path()
+                .trim_start_matches('/')
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_owned(),
+        ))
+    } else {
+        let (host, path) = remote.split_once(':')?;
+        Some((
+            format!("https://{}", host.rsplit('@').next()?),
+            path.trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_owned(),
+        ))
+    }
+}
+
+fn relative_project_path<'a>(remote_path: &'a str, remote_origin: &str, web_url: &str) -> &'a str {
+    web_url
+        .strip_prefix(remote_origin)
+        .and_then(|path| path.strip_prefix('/'))
+        .filter(|path| !path.is_empty())
+        .and_then(|prefix| remote_path.strip_prefix(prefix))
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .unwrap_or(remote_path)
+}
+
+pub fn resolve_project(
+    remote: Option<&str>,
+    repo: Option<&str>,
+    config: Option<&crate::config::GitConfig>,
+    env: &ProjectEnvironment,
+) -> Result<ProjectIdentity> {
+    let configured = config.and_then(|c| c.provider.as_deref());
+    if configured.is_some_and(|p| p != "github" && p != "gitlab") {
+        return Err(Error::Config(
+            "git.provider must be github or gitlab".into(),
+        ));
+    }
+    let http_remote =
+        remote.is_some_and(|url| url.starts_with("https://") || url.starts_with("http://"));
+    let remote = remote.and_then(remote_parts);
+    let ci = env.server_url.as_deref().zip(env.project_path.as_deref());
+    let is_gitlab = configured == Some("gitlab")
+        || (configured.is_none()
+            && (ci.is_some()
+                || remote.as_ref().is_some_and(|(url, _)| {
+                    reqwest::Url::parse(url)
+                        .ok()
+                        .and_then(|u| {
+                            u.host_str()
+                                .map(|h| h == "gitlab.com" || h.starts_with("gitlab."))
+                        })
+                        .unwrap_or(false)
+                })));
+    if !is_gitlab
+        && configured.is_none()
+        && repo.is_none()
+        && remote
+            .as_ref()
+            .is_some_and(|(url, _)| url != "https://github.com" && url != "http://github.com")
+    {
+        return Err(Error::Git(
+            "cannot identify git provider or project from remote".into(),
+        ));
+    }
+    let configured_url = config.and_then(|c| c.base_url.as_deref());
+    let ci_url = ci.map(|(url, _)| url);
+    let base = if is_gitlab {
+        configured_url
+            .or(ci_url)
+            .or_else(|| remote.as_ref().map(|(url, _)| url.as_str()))
+            .unwrap_or("https://gitlab.com")
+    } else {
+        "https://github.com"
+    };
+    let web_url = clean_web_url(base)?;
+    let remote_path = remote.as_ref().map(|(origin, path)| {
+        if is_gitlab && http_remote {
+            relative_project_path(path, origin, &web_url)
+        } else {
+            path.as_str()
+        }
+    });
+    let ci_path = if is_gitlab {
+        ci.map(|(_, path)| path)
+    } else {
+        None
+    };
+    let path = repo
+        .or(ci_path)
+        .or(remote_path)
+        .ok_or_else(|| Error::Git("no origin remote found".into()))?;
+    if !valid_project_path(path) {
+        return Err(Error::Git("invalid project path".into()));
+    }
+    let use_ci = is_gitlab
+        && ci_url.and_then(|url| clean_web_url(url).ok()).as_deref() == Some(web_url.as_str());
+    let ci_origin = ci_url
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .map(|url| url.origin());
+    let ci_api_url = if use_ci {
+        env.api_v4_url.as_deref().map(clean_web_url).transpose()?
+    } else {
+        None
+    };
+    let trusted_ci_api = ci_api_url
+        .as_deref()
+        .is_none_or(|url| reqwest::Url::parse(url).ok().map(|url| url.origin()) == ci_origin);
+    let api_url = if is_gitlab {
+        ci_api_url
+            .filter(|_| trusted_ci_api)
+            .unwrap_or_else(|| format!("{web_url}/api/v4"))
+    } else {
+        "https://api.github.com".into()
+    };
+    let project_id = if use_ci && env.project_path.as_deref() == Some(path) {
+        env.project_id
+            .clone()
+            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+    } else {
+        None
+    };
+    let remote_origin = remote
+        .as_ref()
+        .and_then(|(url, _)| reqwest::Url::parse(url).ok())
+        .map(|url| url.origin());
+    let job_token_allowed = use_ci
+        && ci_origin.is_some()
+        && trusted_ci_api
+        && remote_origin.is_none_or(|origin| Some(origin) == ci_origin);
+    let token_source = if is_gitlab {
+        if let Some(name) = config.and_then(|c| c.token_env.as_ref()) {
+            if name == "CI_JOB_TOKEN" {
+                if !job_token_allowed {
+                    return Err(Error::Config(
+                        "CI_JOB_TOKEN requires matching GitLab CI origins".into(),
+                    ));
+                }
+                TokenSource::JobToken
+            } else {
+                TokenSource::Environment(name.clone())
+            }
+        } else if env.job_token_available && !env.gitlab_token_available && job_token_allowed {
+            TokenSource::JobToken
+        } else {
+            TokenSource::Environment("GITLAB_TOKEN".into())
+        }
+    } else {
+        TokenSource::Environment("GITHUB_TOKEN".into())
+    };
+    Ok(ProjectIdentity {
+        provider: if is_gitlab {
+            ProjectProvider::GitLab
+        } else {
+            ProjectProvider::GitHub
+        },
+        web_url,
+        api_url,
+        path: path.to_owned(),
+        project_id,
+        token_source,
+    })
+}
+
+fn valid_project_path(path: &str) -> bool {
+    path.contains('/')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 #[cfg(test)]
@@ -63,7 +295,8 @@ pub fn previous_tag_filtered(
     )
     .cwd(repo_root)
     .read()?;
-    let target_is_tag = stdout.lines().any(|tag| tag.trim() == current_tag);
+    let target_is_tag = verify_ref(repo_root, &format!("refs/tags/{current_tag}"))
+        .is_ok_and(|commit| commit == target);
     let stable = matches!(channel, crate::workflow::Channel::Stable);
     let prerelease = Regex::new(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?-").unwrap();
     for tag in stdout.lines().map(str::trim).filter(|tag| !tag.is_empty()) {
@@ -90,6 +323,16 @@ pub fn verify_ref(repo_root: &Path, git_ref: &str) -> Result<String> {
     .read()
     .map(|s| s.trim().to_string())
     .map_err(|_| Error::Git(format!("Cannot resolve git reference '{git_ref}'")))
+}
+
+pub fn is_shallow(repo_root: &Path) -> Result<bool> {
+    Ok(
+        process::cmd("git", ["rev-parse", "--is-shallow-repository"])
+            .cwd(repo_root)
+            .read()?
+            .trim()
+            == "true",
+    )
 }
 
 fn root_commit(repo_root: &Path, target: &str) -> Result<String> {
@@ -288,10 +531,16 @@ mod tests {
         assert!(log_between_paths(repo.path(), "typo", "v2", &[]).is_err());
     }
 
+    fn project_path_for_remote(remote: &str) -> String {
+        resolve_project(Some(remote), None, None, &ProjectEnvironment::default())
+            .unwrap()
+            .path
+    }
+
     #[test]
     fn test_parse_owner_repo_ssh() {
         assert_eq!(
-            parse_owner_repo("git@github.com:jdx/pitchfork.git").unwrap(),
+            project_path_for_remote("git@github.com:jdx/pitchfork.git"),
             "jdx/pitchfork"
         );
     }
@@ -299,7 +548,7 @@ mod tests {
     #[test]
     fn test_parse_owner_repo_https() {
         assert_eq!(
-            parse_owner_repo("https://github.com/jdx/pitchfork.git").unwrap(),
+            project_path_for_remote("https://github.com/jdx/pitchfork.git"),
             "jdx/pitchfork"
         );
     }
@@ -441,5 +690,172 @@ mod tests {
             parse_commit_credits(raw),
             vec![("abc".to_string(), vec!["Ada".to_string()])]
         );
+    }
+}
+
+#[cfg(test)]
+mod project_identification_tests {
+    use super::*;
+
+    #[test]
+    fn gitlab_job_token_requires_matching_ci_origins() {
+        let env = ProjectEnvironment {
+            server_url: Some("https://ci.example.com".into()),
+            api_v4_url: Some("https://ci.example.com/api/v4".into()),
+            project_path: Some("group/project".into()),
+            job_token_available: true,
+            ..Default::default()
+        };
+        let config = crate::config::GitConfig {
+            provider: Some("gitlab".into()),
+            base_url: Some("https://other.example.com".into()),
+            ..Default::default()
+        };
+        let project = resolve_project(None, None, Some(&config), &env).unwrap();
+        assert_ne!(project.token_source, TokenSource::JobToken);
+
+        let env = ProjectEnvironment {
+            api_v4_url: Some("https://attacker.example.com/api/v4".into()),
+            ..env
+        };
+        let project = resolve_project(None, None, None, &env).unwrap();
+        assert_ne!(project.token_source, TokenSource::JobToken);
+        assert_eq!(project.api_url, "https://ci.example.com/api/v4");
+    }
+
+    #[test]
+    fn gitlab_job_token_rejects_explicit_token_for_foreign_origin() {
+        let env = ProjectEnvironment {
+            server_url: Some("https://ci.example.com".into()),
+            project_path: Some("group/project".into()),
+            job_token_available: true,
+            ..Default::default()
+        };
+        let config = crate::config::GitConfig {
+            provider: Some("gitlab".into()),
+            base_url: Some("https://other.example.com".into()),
+            token_env: Some("CI_JOB_TOKEN".into()),
+        };
+        assert!(resolve_project(None, None, Some(&config), &env).is_err());
+        let project = resolve_project(
+            Some("https://other.example.com/group/project.git"),
+            None,
+            None,
+            &env,
+        )
+        .unwrap();
+        assert_ne!(project.token_source, TokenSource::JobToken);
+    }
+
+    #[test]
+    fn gitlab_resolution_preserves_instance_project_and_token_source() {
+        let ci = ProjectEnvironment {
+            server_url: Some("https://gitlab.example.com".into()),
+            api_v4_url: Some("https://gitlab.example.com/custom/api/v4".into()),
+            project_path: Some("group/sub/project".into()),
+            project_id: Some("123".into()),
+            job_token_available: true,
+            ..Default::default()
+        };
+        let project = resolve_project(
+            Some("git@gitlab.example.com:group/sub/project.git"),
+            None,
+            None,
+            &ci,
+        )
+        .unwrap();
+        assert_eq!(project.provider, ProjectProvider::GitLab);
+        assert_eq!(project.web_url, "https://gitlab.example.com");
+        assert_eq!(project.api_url, "https://gitlab.example.com/custom/api/v4");
+        assert_eq!(project.path, "group/sub/project");
+        assert_eq!(project.project_id.as_deref(), Some("123"));
+        assert_eq!(project.token_source, TokenSource::JobToken);
+
+        let config = crate::config::GitConfig {
+            provider: Some("gitlab".into()),
+            base_url: Some("https://gitlab.other.test/root".into()),
+            token_env: Some("MY_TOKEN".into()),
+        };
+        let project = resolve_project(
+            Some("ssh://git@gitlab.example.com/group/sub/project.git"),
+            Some("another/nested/repo"),
+            Some(&config),
+            &ci,
+        )
+        .unwrap();
+        assert_eq!(project.path, "another/nested/repo");
+        assert_eq!(project.web_url, "https://gitlab.other.test/root");
+        assert_eq!(project.api_url, "https://gitlab.other.test/root/api/v4");
+        assert_eq!(project.project_id, None);
+        assert_eq!(
+            project.token_source,
+            TokenSource::Environment("MY_TOKEN".into())
+        );
+    }
+
+    #[test]
+    fn gitlab_repo_override_keeps_remote_provider_and_never_reuses_other_project_id() {
+        let ci = ProjectEnvironment {
+            project_path: Some("old/project".into()),
+            project_id: Some("123".into()),
+            ..Default::default()
+        };
+        let project = resolve_project(
+            Some("https://user:secret@gitlab.example.com/group/sub/project.git"),
+            Some("new/project"),
+            None,
+            &ci,
+        )
+        .unwrap();
+        assert_eq!(project.provider, ProjectProvider::GitLab);
+        assert_eq!(project.web_url, "https://gitlab.example.com");
+        assert_eq!(project.api_url, "https://gitlab.example.com/api/v4");
+        assert_eq!(project.project_id, None);
+        assert_eq!(project.path, "new/project");
+        assert_eq!(
+            project.token_source,
+            TokenSource::Environment("GITLAB_TOKEN".into())
+        );
+    }
+
+    #[test]
+    fn gitlab_http_remote_uses_project_path_relative_to_instance() {
+        let config = crate::config::GitConfig {
+            provider: Some("gitlab".into()),
+            base_url: Some("https://code.example.com/gitlab".into()),
+            ..Default::default()
+        };
+        let environment = ProjectEnvironment::default();
+        let project = resolve_project(
+            Some("https://code.example.com/gitlab/group/sub/project.git"),
+            None,
+            Some(&config),
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(project.path, "group/sub/project");
+        assert_eq!(project.api_url, "https://code.example.com/gitlab/api/v4");
+
+        let ssh_project = resolve_project(
+            Some("git@code.example.com:gitlab/sub/project.git"),
+            None,
+            Some(&config),
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(ssh_project.path, "gitlab/sub/project");
+    }
+
+    #[test]
+    fn github_repo_override_uses_github_web_url() {
+        let project = resolve_project(
+            Some("https://other.example.com/group/project.git"),
+            Some("owner/repo"),
+            None,
+            &ProjectEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(project.provider, ProjectProvider::GitHub);
+        assert_eq!(project.web_url, "https://github.com");
     }
 }

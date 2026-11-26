@@ -8,7 +8,7 @@ AI-generated release notes for people who read release notes.
 
 communique turns your git history, pull requests, and repository context into
 polished release notes. It can print notes locally, update `CHANGELOG.md`, or
-publish directly to a GitHub Release.
+publish directly to a GitHub or GitLab Release.
 
 ## Sponsors
 
@@ -118,6 +118,71 @@ GitHub context and GitHub Release publishing also need a token:
 ```sh
 export GITHUB_TOKEN="$(gh auth token)"
 ```
+
+### GitLab and self-hosted instances
+
+GitLab.com and self-hosted GitLab use the same generation workflow. GitLab CI
+provides the server and project automatically; outside CI, GitLab.com and hosts
+named `gitlab.*` can be detected from the `origin` remote. For other self-hosted
+hosts, configure the provider explicitly. HTTPS, SSH and nested group paths are
+supported. For example, `group/subgroup/project` is a valid project path:
+
+```toml
+[git]
+provider = "gitlab"
+base_url = "https://gitlab.example.com"
+token_env = "GITLAB_TOKEN"
+```
+
+`base_url` is the web URL of the installation, without credentials, query or
+fragment. `token_env` names an environment variable; do not put the token in
+the configuration. Without an explicit token source, `GITLAB_TOKEN` is used
+when set, otherwise an eligible `CI_JOB_TOKEN` is used in GitLab CI. Personal,
+project and group access tokens must have the permissions needed for the APIs
+used; an `api` scoped token with sufficient project access is suitable for
+publishing. GitLab job tokens have [restricted API access](https://docs.gitlab.com/ci/jobs/ci_job_token/):
+MR diffs and issues may be unavailable, and publication depends on the job
+user's permissions and instance settings. Reading an individual tag with a job
+token requires GitLab 18.8 or later. Test the permissions on your instance.
+GitLab does not require a GitHub token or `gh`.
+
+In GitLab CI, `CI_SERVER_URL`, `CI_API_V4_URL`, `CI_PROJECT_ID` and
+`CI_PROJECT_PATH` identify the installation and project, and `CI_COMMIT_TAG`
+supplies the target when omitted. The job token is used only when the relevant
+origins match. An explicit `base_url` overrides the detected server. Configure
+`COMMUNIQUE_CA_CERT` as the path to a PEM corporate CA bundle for GitLab API
+requests when needed; TLS hostname and certificate verification remain enabled.
+The LLM endpoint has its own trust configuration.
+
+Keep tokens in masked, protected CI variables and keep credentials out of remote
+URLs, prompts and repository files. Communiqué redacts known credentials, but
+cannot recognize every transformed secret. The model receives repository
+content; use an endpoint authorized to process it.
+
+```sh
+# Arbitrary refs; the second ref is the baseline.
+communique generate HEAD HEAD~5 --dry-run
+# A tag pipeline can omit the target and auto-detect the previous reachable tag.
+communique generate --dry-run
+# Explicit writes; --dry-run previews without publishing or changing CHANGELOG.md.
+communique generate v2.0.0 --gitlab-release --changelog
+```
+
+Baseline selection respects `--tag-pattern`, `--channel` and package settings.
+Fetch full history and tags in CI; shallow clones produce a warning and can
+yield incomplete results. When GitLab metadata is unavailable, local history
+and code diff remain available with a warning; explicit publication errors are
+reported. Repeated publication updates the release, and repeated changelog
+generation replaces the corresponding entry. Review generated output before
+publishing; `--draft` and `communique publish` support an editable review step.
+
+See [the GitLab CI example](examples/gitlab-ci/.gitlab-ci.yml) for a tag
+pipeline with a custom OpenAI-compatible endpoint such as OmniRoute. Configure
+`OPENAI_BASE_URL` to the endpoint's `/v1` base, `OPENAI_API_KEY` as a protected
+secret and `LLM_MODEL` to a model available there. The custom endpoint receives
+Chat Completions requests; endpoint availability and model tool-call support
+depend on the deployment. The manual publication job generates notes again, so
+its output can differ from the preview; use a draft to publish reviewed content.
 
 Initialize a config file in your repository:
 

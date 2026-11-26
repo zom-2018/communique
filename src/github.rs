@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub struct GitHubClient {
+pub struct GitHubProvider {
     client: reqwest::Client,
     token: String,
     owner: String,
@@ -10,44 +10,7 @@ pub struct GitHubClient {
     base_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Release {
-    pub id: u64,
-    #[allow(dead_code)]
-    pub tag_name: String,
-    #[allow(dead_code)]
-    pub name: Option<String>,
-    pub body: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PullRequest {
-    pub number: u64,
-    pub title: String,
-    pub body: Option<String>,
-    pub user: User,
-    pub labels: Vec<Label>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Issue {
-    pub number: u64,
-    pub title: String,
-    pub body: Option<String>,
-    pub state: String,
-    pub user: User,
-    pub labels: Vec<Label>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct User {
-    pub login: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Label {
-    pub name: String,
-}
+pub use crate::git_provider::{Issue, PullRequest, Release};
 
 #[derive(Debug, Serialize)]
 struct UpdateRelease {
@@ -65,7 +28,7 @@ struct UpdateRelease {
     body: Option<String>,
 }
 
-impl GitHubClient {
+impl GitHubProvider {
     pub fn new(token: String, owner_repo: &str) -> Result<Self> {
         Self::with_base_url(token, owner_repo, "https://api.github.com".into())
     }
@@ -275,16 +238,16 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn setup() -> (MockServer, GitHubClient) {
+    async fn setup() -> (MockServer, GitHubProvider) {
         let server = MockServer::start().await;
         let client =
-            GitHubClient::with_base_url("test-token".into(), "owner/repo", server.uri()).unwrap();
+            GitHubProvider::with_base_url("test-token".into(), "owner/repo", server.uri()).unwrap();
         (server, client)
     }
 
     #[test]
     fn test_new_invalid_owner_repo() {
-        let result = GitHubClient::new("token".into(), "invalid");
+        let result = GitHubProvider::new("token".into(), "invalid");
         assert!(result.is_err());
         assert!(
             result
@@ -310,7 +273,7 @@ mod tests {
             .mount(&server)
             .await;
         let client =
-            GitHubClient::with_base_url("token".into(), "test/repo", server.uri()).unwrap();
+            GitHubProvider::with_base_url("token".into(), "test/repo", server.uri()).unwrap();
         assert_eq!(
             client.tag_commit("cli/v2.0.0#release").await.unwrap(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

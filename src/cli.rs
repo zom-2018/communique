@@ -9,9 +9,9 @@ use crate::usage;
 #[derive(Debug, Args)]
 #[usage(effect = "read")]
 pub struct Generate {
-    /// Git tag to generate release notes for
+    /// Target git ref (defaults to CI_COMMIT_TAG)
     #[usage(arg)]
-    pub tag: String,
+    pub tag: Option<String>,
 
     #[usage(flatten)]
     pub workflow: crate::workflow::WorkflowOptions,
@@ -23,6 +23,10 @@ pub struct Generate {
     /// Push editorialized notes to the GitHub release
     #[usage(long, effect = "write", conflicts = "--draft")]
     pub github_release: bool,
+
+    /// Create or update a GitLab release
+    #[usage(long, effect = "write", conflicts = "--draft")]
+    pub gitlab_release: bool,
 
     /// Update CHANGELOG.md with the generated changelog entry
     #[usage(long, effect = "write")]
@@ -245,7 +249,7 @@ mod tests {
         match command {
             Command::Generate(generate) => {
                 assert_eq!(expected, "generate");
-                assert_eq!(generate.tag, "v1.2.3");
+                assert_eq!(generate.tag.as_deref(), Some("v1.2.3"));
                 assert_eq!(generate.prev_tag.as_deref(), Some("v1.2.2"));
                 assert!(generate.github_release);
                 assert_eq!(generate.max_tokens, Some(2048));

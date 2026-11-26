@@ -69,7 +69,7 @@ where
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok())
-                        .map(|secs| secs * 1000)
+                        .map(|secs| secs.saturating_mul(1000).min(config.max_delay_ms))
                         .unwrap_or(delay_ms)
                 } else {
                     delay_ms
@@ -89,11 +89,12 @@ where
             Ok(resp) => return Ok(resp),
             Err(e) if e.is_connect() || e.is_timeout() => {
                 if attempt == config.max_retries {
-                    return Err(e.into());
+                    return Err(e.without_url().into());
                 }
                 let jitter = jitter_ms();
                 log::warn!(
-                    "{context}: {e} (attempt {}/{}), retrying in {}ms",
+                    "{context}: {} (attempt {}/{}), retrying in {}ms",
+                    e.without_url(),
                     attempt + 1,
                     config.max_retries + 1,
                     delay_ms + jitter,
@@ -101,7 +102,7 @@ where
                 tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
                 delay_ms = (delay_ms * 2).min(config.max_delay_ms);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e.without_url().into()),
         }
     }
 
@@ -160,71 +161,53 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_success_no_retry() {
+    async fn mock_sequence(sequence: Sequence, expected: u64) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(Sequence::status(vec![200]))
-            .expect(1)
+            .respond_with(sequence)
+            .expect(expected)
             .mount(&server)
             .await;
+        server
+    }
 
+    async fn request(server: &MockServer, config: &RetryConfig) -> reqwest::Response {
         let client = reqwest::Client::new();
         let url = server.uri();
-        let resp = retry_request_with_config("test", &fast_config(), || client.get(&url).send())
+        retry_request_with_config("test", config, || client.get(&url).send())
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_success_no_retry() {
+        let server = mock_sequence(Sequence::status(vec![200]), 1).await;
+
+        let resp = request(&server, &fast_config()).await;
         assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
     async fn test_retry_on_500_then_success() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(Sequence::status(vec![500, 200]))
-            .expect(2)
-            .mount(&server)
-            .await;
+        let server = mock_sequence(Sequence::status(vec![500, 200]), 2).await;
 
-        let client = reqwest::Client::new();
-        let url = server.uri();
-        let resp = retry_request_with_config("test", &fast_config(), || client.get(&url).send())
-            .await
-            .unwrap();
+        let resp = request(&server, &fast_config()).await;
         assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
     async fn test_no_retry_on_400() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(Sequence::status(vec![400]))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let server = mock_sequence(Sequence::status(vec![400]), 1).await;
 
-        let client = reqwest::Client::new();
-        let url = server.uri();
-        let resp = retry_request_with_config("test", &fast_config(), || client.get(&url).send())
-            .await
-            .unwrap();
+        let resp = request(&server, &fast_config()).await;
         assert_eq!(resp.status(), 400);
     }
 
     #[tokio::test]
     async fn test_retry_on_429() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(Sequence::status(vec![429, 200]))
-            .expect(2)
-            .mount(&server)
-            .await;
+        let server = mock_sequence(Sequence::status(vec![429, 200]), 2).await;
 
-        let client = reqwest::Client::new();
-        let url = server.uri();
-        let resp = retry_request_with_config("test", &fast_config(), || client.get(&url).send())
-            .await
-            .unwrap();
+        let resp = request(&server, &fast_config()).await;
         assert_eq!(resp.status(), 200);
     }
 
@@ -244,20 +227,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_after_header() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(Sequence::status(vec![429, 200]).with_header(0, "retry-after", "1"))
-            .expect(2)
-            .mount(&server)
-            .await;
+    async fn gitlab_retry_after_is_bounded_even_for_extreme_values() {
+        let server = mock_sequence(
+            Sequence::status(vec![429, 200]).with_header(0, "retry-after", "18446744073709551615"),
+            2,
+        )
+        .await;
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), request(&server, &fast_config()))
+                .await
+                .expect("retry must be bounded");
+        assert_eq!(response.status(), 200);
+    }
 
-        let client = reqwest::Client::new();
-        let url = server.uri();
+    #[tokio::test]
+    async fn test_retry_after_header() {
+        let server = mock_sequence(
+            Sequence::status(vec![429, 200]).with_header(0, "retry-after", "1"),
+            2,
+        )
+        .await;
+
         let start = std::time::Instant::now();
-        let resp = retry_request_with_config("test", &fast_config(), || client.get(&url).send())
-            .await
-            .unwrap();
+        let config = RetryConfig {
+            max_delay_ms: 2_000,
+            ..fast_config()
+        };
+        let resp = request(&server, &config).await;
         let elapsed = start.elapsed();
         assert_eq!(resp.status(), 200);
         assert!(
