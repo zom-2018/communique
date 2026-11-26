@@ -199,6 +199,7 @@ dependencies = [
  "futures-util",
  "log",
  "miette",
+ "percent-encoding",
  "regex",
  "reqwest",
  "serde",

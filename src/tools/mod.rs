@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::Result;
-use crate::github::GitHubClient;
+use crate::git_provider::GitProvider;
 use crate::llm::ToolDefinition;
 
 /// In-memory cache for tool call results, keyed by (tool_name, input_json).
@@ -69,7 +69,7 @@ pub async fn dispatch(
     name: &str,
     input: &serde_json::Value,
     repo_root: &Path,
-    github: Option<&GitHubClient>,
+    github: Option<&dyn GitProvider>,
 ) -> Result<String> {
     match name {
         "read_file" => read_file::execute(repo_root, input),

@@ -15,6 +15,7 @@ pub struct GenerateOptions {
     pub workflow: crate::workflow::WorkflowOptions,
     pub prev_tag: Option<String>,
     pub github_release: bool,
+    pub gitlab_release: bool,
     pub changelog: bool,
     pub concise: bool,
     pub dry_run: bool,
@@ -41,7 +42,9 @@ struct Context {
     rules: crate::workflow::Rules,
     system_extra: Option<String>,
     context: Option<String>,
-    github_client: Option<github::GitHubClient>,
+    github_client: Option<Box<dyn crate::git_provider::GitProvider>>,
+    gitlab_url: Option<String>,
+    token_env: Option<String>,
 }
 
 impl Context {
@@ -59,7 +62,7 @@ impl Context {
 }
 
 fn validate_generate_options(opts: &GenerateOptions) -> miette::Result<()> {
-    if opts.github_release && opts.tag == "HEAD" {
+    if (opts.github_release || opts.gitlab_release) && opts.tag == "HEAD" {
         return Err(miette::miette!(
             "--github-release cannot be used with HEAD because HEAD is an unreleased changelog target. Use --changelog, or generate notes for a real tag."
         ));
@@ -142,8 +145,10 @@ pub async fn run(mut opts: GenerateOptions) -> miette::Result<()> {
 
     let ctx = gather_context(&opts, &job).await?;
     let include_changelog = opts.changelog || opts.concise || opts.workflow.draft.is_some();
-    let include_release_notes =
-        opts.github_release || !opts.concise || opts.workflow.draft.is_some();
+    let include_release_notes = opts.github_release
+        || opts.gitlab_release
+        || !opts.concise
+        || opts.workflow.draft.is_some();
     let mut parsed = generate_notes(
         &ctx,
         opts.dry_run,
@@ -178,15 +183,16 @@ pub async fn run(mut opts: GenerateOptions) -> miette::Result<()> {
         xx::file::write(path, &parsed.review.migration_guide)?;
     }
     if let Some(path) = &opts.workflow.draft {
-        crate::workflow::Draft::new(
+        let mut draft = crate::workflow::Draft::new(
             &ctx.owner_repo,
             &ctx.tag,
             &ctx.prev_tag,
             &ctx.target_commit,
             &parsed,
             opts.workflow.preserve_sections,
-        )
-        .write(path)?;
+        );
+        draft.gitlab_project_url = ctx.gitlab_url.clone();
+        draft.write(path)?;
     }
     publish(&opts, &ctx, &parsed, &job).await?;
 
@@ -228,37 +234,15 @@ pub async fn run(mut opts: GenerateOptions) -> miette::Result<()> {
     Ok(())
 }
 
-async fn gather_context(opts: &GenerateOptions, job: &Arc<ProgressJob>) -> miette::Result<Context> {
-    let github_token = std::env::var("GITHUB_TOKEN").ok();
-
-    if opts.github_release && github_token.is_none() {
-        return Err(crate::error::Error::GitHub(
-            "GITHUB_TOKEN is required for --github-release".into(),
-        )
-        .into());
-    }
-
-    let repo_root = git::repo_root()?;
-    info!("repo root: {}", repo_root.display());
-
-    let config = match &opts.config {
-        Some(path) => config::Config::load_from(path)?,
-        None => config::Config::load(&repo_root)?,
-    }
-    .unwrap_or_default();
-    let defaults = config.defaults.unwrap_or_default();
-
-    let model = resolve_model(opts, &defaults);
+fn build_llm_client(
+    opts: &GenerateOptions,
+    defaults: &Defaults,
+) -> miette::Result<Box<dyn LlmClient>> {
+    let model = resolve_model(opts, defaults);
     let max_tokens = opts
         .max_tokens
         .or(defaults.max_tokens)
         .unwrap_or(config::DEFAULT_MAX_TOKENS);
-    let owner_repo = match opts.repo.clone().or(defaults.repo.clone()) {
-        Some(r) => r,
-        None => git::detect_remote(&repo_root)?,
-    };
-    info!("repo: {owner_repo}");
-
     // Determine provider
     let provider = opts
         .provider
@@ -277,19 +261,62 @@ async fn gather_context(opts: &GenerateOptions, job: &Arc<ProgressJob>) -> miett
 
     let base_url = resolve_base_url(
         opts,
-        &defaults,
+        defaults,
         &provider,
         std::env::var("OPENAI_BASE_URL").ok(),
     );
 
-    let client = providers::build_client(
+    Ok(providers::build_client(
         &provider,
         api_key,
         model,
         max_tokens,
         base_url,
         &opts.headers,
+    )?)
+}
+
+async fn gather_context(opts: &GenerateOptions, job: &Arc<ProgressJob>) -> miette::Result<Context> {
+    let github_token = std::env::var("GITHUB_TOKEN").ok();
+
+    if opts.github_release && github_token.is_none() {
+        return Err(crate::error::Error::GitHub(
+            "GITHUB_TOKEN is required for --github-release".into(),
+        )
+        .into());
+    }
+
+    let repo_root = git::repo_root()?;
+    info!("repo root: {}", repo_root.display());
+
+    if git::is_shallow(&repo_root)? {
+        eprintln!(
+            "Warning: shallow clone; Git history and release context may be incomplete. Fetch full history and tags for complete results."
+        );
+    }
+
+    let config = match &opts.config {
+        Some(path) => config::Config::load_from(path)?,
+        None => config::Config::load(&repo_root)?,
+    }
+    .unwrap_or_default();
+    let defaults = config.defaults.unwrap_or_default();
+
+    let project = git::detect_project(
+        &repo_root,
+        opts.repo.as_deref().or(defaults.repo.as_deref()),
+        config.git.as_ref(),
     )?;
+    let is_gitlab = project.provider == git::ProjectProvider::GitLab;
+    if opts.gitlab_release && !is_gitlab {
+        return Err(miette::miette!(
+            "--gitlab-release requires a GitLab repository"
+        ));
+    }
+    let owner_repo = project.path.clone();
+    info!("repo: {owner_repo}");
+
+    let client = build_llm_client(opts, &defaults)?;
 
     let prev_tag = match &opts.prev_tag {
         Some(t) => t.clone(),
@@ -309,15 +336,35 @@ async fn gather_context(opts: &GenerateOptions, job: &Arc<ProgressJob>) -> miett
         &format!("Reading git log {prev_tag}..{}...", opts.tag),
     );
 
-    let github_client = github_token
-        .as_ref()
-        .map(|token| github::GitHubClient::new(token.clone(), &owner_repo))
-        .transpose()?;
+    if is_gitlab && opts.github_release {
+        return Err(crate::error::Error::Config(
+            "--github-release requires a GitHub repository".into(),
+        )
+        .into());
+    }
+    let github_client = if is_gitlab {
+        crate::git_provider::gitlab_provider(&project, false)?
+    } else {
+        github_token
+            .filter(|_| !is_gitlab)
+            .as_ref()
+            .map(|token| {
+                github::GitHubProvider::new(token.clone(), &owner_repo)
+                    .map(|client| Box::new(client) as Box<dyn crate::git_provider::GitProvider>)
+            })
+            .transpose()?
+    };
+
+    if opts.gitlab_release && github_client.is_none() && !opts.dry_run {
+        return Err(miette::miette!(
+            "A GitLab token is required for --gitlab-release"
+        ));
+    }
 
     let target_commit = git::resolve_ref(&repo_root, &opts.tag)?;
     Ok(Context {
         repo_root,
-        owner_repo,
+        owner_repo: owner_repo.clone(),
         tag: opts.tag.clone(),
         target_commit,
         prev_tag,
@@ -328,7 +375,213 @@ async fn gather_context(opts: &GenerateOptions, job: &Arc<ProgressJob>) -> miett
         system_extra: config.system_extra,
         context: config.context,
         github_client,
+        gitlab_url: is_gitlab.then(|| format!("{}/{}", project.web_url, owner_repo)),
+        token_env: config.git.as_ref().and_then(|git| git.token_env.clone()),
     })
+}
+
+fn limit_diff(diff: &str) -> String {
+    const LIMIT: usize = 64 * 1024;
+    if diff.len() <= LIMIT {
+        return diff.to_owned();
+    }
+    let mut end = LIMIT;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &diff[..end])
+}
+
+type CommitMrs = std::collections::BTreeMap<String, Vec<crate::git_provider::PullRequest>>;
+
+async fn gitlab_commit_mrs(ctx: &Context, log: &str) -> miette::Result<CommitMrs> {
+    let mut result = CommitMrs::new();
+    if ctx.gitlab_url.is_none() {
+        return Ok(result);
+    }
+    let Some(provider) = ctx.github_client.as_deref() else {
+        log::warn!("GitLab API unavailable without a token; context is incomplete");
+        return Ok(result);
+    };
+    for sha in log
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        let full_sha = git::verify_ref(&ctx.repo_root, sha)?;
+        match provider.merge_requests_for_commit(&full_sha).await {
+            Ok(mrs) => {
+                result.insert(sha.to_owned(), mrs);
+            }
+            Err(_) => {
+                log::warn!("Could not read merge requests for a commit; context is incomplete")
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn add_gitlab_context(
+    ctx: &Context,
+    git_log: &str,
+    commit_mrs: &CommitMrs,
+    system: &mut String,
+    user_msg: &mut String,
+) -> miette::Result<()> {
+    if let Some(project_url) = &ctx.gitlab_url {
+        *system = system
+            .replace(
+                "https://github.com/OWNER/REPO/compare/PREV_TAG...TAG",
+                &format!("{project_url}/-/compare/PREV_TAG...TAG"),
+            )
+            .replace(
+                "https://github.com/OWNER/REPO/pull/123",
+                &format!("{project_url}/-/merge_requests/123"),
+            )
+            .replace(
+                "https://github.com/OWNER/REPO/commit/abc1234",
+                &format!("{project_url}/-/commit/abc1234"),
+            )
+            .replace("GitHub", "GitLab");
+        system.push_str(&format!("\nUse GitLab links on this project: merge requests {project_url}/-/merge_requests/123, issues {project_url}/-/issues/123, commits {project_url}/-/commit/SHA, files {project_url}/-/blob/REF/PATH, tags {project_url}/-/tags/TAG, releases {project_url}/-/releases/TAG. Prioritize the final diff over commit and merge request descriptions. Group related changes, omit fully reverted changes, and identify breaking changes and migrations."));
+        let mut args = vec![
+            "diff".to_string(),
+            ctx.prev_tag.clone(),
+            ctx.target_commit.clone(),
+            "--".into(),
+        ];
+        args.extend(ctx.workflow.paths.iter().map(|p| format!(":(literal){p}")));
+        let diff = limit_diff(&xx::process::cmd("git", args).cwd(&ctx.repo_root).read()?);
+        user_msg.push_str(&format!(
+            "\n## Final diff between refs\n```diff\n{diff}\n```\n"
+        ));
+        if let Some(provider) = ctx.github_client.as_deref() {
+            let mut seen = std::collections::HashSet::new();
+            for sha in git_log
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+            {
+                for mr in commit_mrs.get(sha).into_iter().flatten() {
+                    if !seen.insert(mr.number) {
+                        continue;
+                    }
+                    user_msg.push_str(&format!(
+                        "\n## Merge request !{}: {}\nAuthor: @{}\nLabels: {}\n{}\n",
+                        mr.number,
+                        mr.title,
+                        mr.user.login,
+                        mr.labels
+                            .iter()
+                            .map(|l| l.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        mr.body.as_deref().unwrap_or("")
+                    ));
+                    match provider.related_issues(mr.number).await {
+                        Ok(issues) => {
+                            for issue in issues {
+                                user_msg.push_str(&format!(
+                                    "\nIssue #{}: {}\n{}\n",
+                                    issue.number,
+                                    issue.title,
+                                    issue.body.as_deref().unwrap_or("")
+                                ));
+                            }
+                        }
+                        Err(_) => log::warn!(
+                            "Could not read related issues for merge request !{}; context is incomplete",
+                            mr.number
+                        ),
+                    }
+                    match provider.get_pr_diff(mr.number).await {
+                        Ok(diff) => user_msg.push_str(&format!(
+                            "\nMerge request !{} diff:\n```diff\n{diff}\n```\n",
+                            mr.number,
+                            diff = limit_diff(&diff)
+                        )),
+                        Err(_) => log::warn!(
+                            "Could not read diff for merge request !{}; context is incomplete",
+                            mr.number
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn release_context(ctx: &Context) -> miette::Result<(Option<String>, Vec<(String, String)>)> {
+    // Fetch existing release and recent releases in parallel
+    let match_style = ctx.defaults.match_style.unwrap_or(true);
+    let (existing_release, recent_releases) = if let Some(gh) = ctx.github_client.as_deref() {
+        let existing_fut = async {
+            if ctx.is_unreleased_head() {
+                Ok(None)
+            } else {
+                gh.get_release_by_tag(&ctx.tag).await
+            }
+        };
+        let recent_fut = async {
+            if !match_style {
+                return vec![];
+            }
+            match gh.list_recent_releases(3).await {
+                Ok(releases) => releases
+                    .into_iter()
+                    .filter(|r| r.tag_name != ctx.tag)
+                    .filter_map(|r| {
+                        let body = r.body.unwrap_or_default();
+                        if body.is_empty() {
+                            None
+                        } else {
+                            Some((r.tag_name, body))
+                        }
+                    })
+                    .take(2)
+                    .collect(),
+                Err(e) => {
+                    info!("failed to fetch recent releases for style matching: {e}");
+                    vec![]
+                }
+            }
+        };
+        let (existing_result, recent) = tokio::join!(existing_fut, recent_fut);
+        let existing = match existing_result {
+            Ok(Some(r)) => r.body,
+            Ok(None) => None,
+            Err(_) => {
+                log::warn!("Could not read existing release; release context is incomplete");
+                None
+            }
+        };
+        (existing, recent)
+    } else {
+        (None, vec![])
+    };
+
+    let (existing_release, recent_releases) = if ctx.workflow.preserve_sections {
+        let existing = existing_release
+            .as_deref()
+            .map(crate::workflow::managed_content)
+            .transpose()?
+            .flatten()
+            .map(str::to_owned);
+        let recent = recent_releases
+            .into_iter()
+            .filter_map(|(tag, body)| {
+                crate::workflow::managed_content(&body)
+                    .ok()
+                    .flatten()
+                    .map(|content| (tag, content.to_owned()))
+            })
+            .collect();
+        (existing, recent)
+    } else {
+        (existing_release, recent_releases)
+    };
+
+    Ok((existing_release, recent_releases))
 }
 
 async fn generate_notes(
@@ -344,7 +597,8 @@ async fn generate_notes(
         &ctx.target_commit,
         &ctx.workflow.paths,
     )?;
-    let (git_log, excluded, rule_context) = apply_rules(ctx, &raw_log).await?;
+    let commit_mrs = gitlab_commit_mrs(ctx, &raw_log).await?;
+    let (git_log, excluded, rule_context) = apply_rules(ctx, &raw_log, &commit_mrs).await?;
     let pr_numbers = git::extract_pr_numbers(&git_log);
     let commit_credits: Vec<git::CommitCredit> = git::commit_credits(
         &ctx.repo_root,
@@ -387,92 +641,46 @@ async fn generate_notes(
         )
     };
 
-    // Fetch existing release and recent releases in parallel
-    let match_style = ctx.defaults.match_style.unwrap_or(true);
-    let (existing_release, recent_releases) = if let Some(gh) = &ctx.github_client {
-        let existing_fut = async {
-            if ctx.is_unreleased_head() {
-                Ok(None)
-            } else {
-                gh.get_release_by_tag(&ctx.tag).await
-            }
-        };
-        let recent_fut = async {
-            if !match_style {
-                return vec![];
-            }
-            match gh.list_recent_releases(3).await {
-                Ok(releases) => releases
-                    .into_iter()
-                    .filter(|r| r.tag_name != ctx.tag)
-                    .filter_map(|r| {
-                        let body = r.body.unwrap_or_default();
-                        if body.is_empty() {
-                            None
-                        } else {
-                            Some((r.tag_name, body))
-                        }
-                    })
-                    .take(2)
-                    .collect(),
-                Err(e) => {
-                    info!("failed to fetch recent releases for style matching: {e}");
-                    vec![]
-                }
-            }
-        };
-        let (existing_result, recent) = tokio::join!(existing_fut, recent_fut);
-        let existing = match existing_result? {
-            Some(r) => r.body,
-            None => None,
-        };
-        (existing, recent)
-    } else {
-        (None, vec![])
-    };
-
-    let (existing_release, recent_releases) = if ctx.workflow.preserve_sections {
-        let existing = existing_release
-            .as_deref()
-            .map(crate::workflow::managed_content)
-            .transpose()?
-            .flatten()
-            .map(str::to_owned);
-        let recent = recent_releases
-            .into_iter()
-            .filter_map(|(tag, body)| {
-                crate::workflow::managed_content(&body)
-                    .ok()
-                    .flatten()
-                    .map(|content| (tag, content.to_owned()))
-            })
-            .collect();
-        (existing, recent)
-    } else {
-        (existing_release, recent_releases)
-    };
+    let (existing_release, recent_releases) = release_context(ctx).await?;
 
     let emoji = ctx.defaults.emoji.unwrap_or(true);
-    let system = prompt::system_prompt(
-        ctx.system_extra.as_deref(),
+    let mut system = prompt::system_prompt(
+        if ctx.gitlab_url.is_some() {
+            None
+        } else {
+            ctx.system_extra.as_deref()
+        },
         emoji,
         include_release_notes,
         include_changelog,
     );
-    let mut user_msg = prompt::user_prompt(&prompt::UserPromptContext {
-        tag: &ctx.tag,
-        prev_tag: &ctx.prev_tag,
-        owner_repo: &ctx.owner_repo,
-        git_log: &git_log,
-        pr_numbers: &pr_numbers,
-        is_unreleased_head: ctx.is_unreleased_head(),
-        changelog_entry: changelog_entry.as_deref(),
-        existing_release: existing_release.as_deref(),
-        context: ctx.context.as_deref(),
-        recent_releases: &recent_releases,
-    });
+    let mut user_msg = prompt::user_prompt_with_url(
+        &prompt::UserPromptContext {
+            tag: &ctx.tag,
+            prev_tag: &ctx.prev_tag,
+            owner_repo: &ctx.owner_repo,
+            git_log: &git_log,
+            pr_numbers: &pr_numbers,
+            is_unreleased_head: ctx.is_unreleased_head(),
+            changelog_entry: changelog_entry.as_deref(),
+            existing_release: existing_release.as_deref(),
+            context: ctx.context.as_deref(),
+            recent_releases: &recent_releases,
+        },
+        ctx.gitlab_url.as_deref(),
+    );
 
-    if let Some(section) = prompt::commit_credits_section(&commit_credits) {
+    add_gitlab_context(ctx, &git_log, &commit_mrs, &mut system, &mut user_msg).await?;
+    if ctx.gitlab_url.is_some()
+        && let Some(extra) = &ctx.system_extra
+    {
+        system.push_str("\n\n");
+        system.push_str(extra);
+    }
+
+    if ctx.gitlab_url.is_none()
+        && let Some(section) = prompt::commit_credits_section(&commit_credits)
+    {
         user_msg.push_str(&section);
     }
 
@@ -487,11 +695,28 @@ async fn generate_notes(
         user_msg.push_str("Return migration_guide as a standalone Markdown upgrade guide. For each verified breaking change explain who is affected, required steps, and sourced before/after examples. If no migration is needed, say so explicitly. Flag unknown details instead of inventing steps.\n");
     }
     job.prop("message", "Generating release notes...");
-    let tool_defs = tools::all_definitions(
+    let mut tool_defs = tools::all_definitions(
         ctx.github_client.is_some(),
         include_release_notes,
         include_changelog,
     );
+
+    if ctx.gitlab_url.is_some() {
+        for tool in &mut tool_defs {
+            tool.description = tool
+                .description
+                .replace("GitHub", "GitLab")
+                .replace("pull request", "merge request")
+                .replace("PR", "MR");
+            if let Some(number) = tool
+                .input_schema
+                .pointer_mut("/properties/number/description")
+                && let Some(description) = number.as_str()
+            {
+                *number = serde_json::Value::String(description.replace("PR", "MR"));
+            }
+        }
+    }
 
     let verify_links = !dry_run && ctx.defaults.verify_links.unwrap_or(true);
 
@@ -501,8 +726,10 @@ async fn generate_notes(
         user_message: &user_msg,
         tool_defs,
         repo_root: &ctx.repo_root,
-        github: ctx.github_client.as_ref(),
+        github: ctx.github_client.as_deref(),
         verify_links,
+        gitlab_url: ctx.gitlab_url.as_deref(),
+        token_env: ctx.token_env.as_deref(),
         require_release_notes: include_release_notes,
         require_changelog: include_changelog,
         job,
@@ -518,44 +745,82 @@ async fn publish(
     parsed: &ParsedOutput,
     job: &Arc<ProgressJob>,
 ) -> miette::Result<()> {
-    if opts.github_release && !opts.dry_run {
+    if (opts.github_release || opts.gitlab_release) && !opts.dry_run {
         job.prop(
             "message",
-            &format!("Updating GitHub release for {}...", ctx.tag),
-        );
-        let gh = ctx.github_client.as_ref().unwrap();
-        match gh.get_release_by_tag(&ctx.tag).await? {
-            Some(release) => {
-                let body = if opts.workflow.preserve_sections {
-                    crate::workflow::merge_body(
-                        release.body.as_deref().unwrap_or_default(),
-                        &parsed.release_body,
-                    )?
+            &format!(
+                "Updating {} release for {}...",
+                if opts.gitlab_release {
+                    "GitLab"
                 } else {
-                    parsed.release_body.clone()
-                };
-                gh.update_release(
-                    release.id,
-                    &release.tag_name,
-                    if opts.workflow.preserve_sections {
-                        None
-                    } else {
-                        Some(&parsed.release_title)
-                    },
-                    Some(&body),
-                )
-                .await?;
-            }
-            None => {
-                job.set_status(ProgressStatus::Warn);
-                job.prop(
-                    "message",
-                    &format!("No GitHub release found for {} — skipping update", ctx.tag),
-                );
+                    "GitHub"
+                },
+                ctx.tag
+            ),
+        );
+        let gh = ctx.github_client.as_deref().unwrap();
+        if opts.gitlab_release {
+            let remote_commit = gh.tag_commit(&ctx.tag).await?;
+            if remote_commit != ctx.target_commit {
+                return Err(miette::miette!(
+                    "Tag {} has moved; regenerate before publishing",
+                    ctx.tag
+                ));
             }
         }
+        publish_release(opts, ctx, parsed, job, gh).await?;
     }
 
+    Ok(())
+}
+
+async fn publish_release(
+    opts: &GenerateOptions,
+    ctx: &Context,
+    parsed: &ParsedOutput,
+    job: &Arc<ProgressJob>,
+    gh: &dyn crate::git_provider::GitProvider,
+) -> miette::Result<()> {
+    match gh.get_release_by_tag(&ctx.tag).await? {
+        Some(release) => {
+            let body = if opts.workflow.preserve_sections {
+                crate::workflow::merge_body(
+                    release.body.as_deref().unwrap_or_default(),
+                    &parsed.release_body,
+                )?
+            } else {
+                parsed.release_body.clone()
+            };
+            gh.update_release(
+                release.id,
+                &release.tag_name,
+                if opts.workflow.preserve_sections {
+                    None
+                } else {
+                    Some(&parsed.release_title)
+                },
+                Some(&body),
+            )
+            .await?;
+        }
+        None => {
+            if opts.gitlab_release {
+                gh.create_release(
+                    &ctx.tag,
+                    &parsed.release_title,
+                    &parsed.release_body,
+                    opts.workflow.preserve_sections,
+                )
+                .await?;
+                return Ok(());
+            }
+            job.set_status(ProgressStatus::Warn);
+            job.prop(
+                "message",
+                &format!("No GitHub release found for {} — skipping update", ctx.tag),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -577,6 +842,7 @@ mod tests {
             workflow: Default::default(),
             prev_tag: None,
             github_release: false,
+            gitlab_release: false,
             changelog: false,
             concise: false,
             dry_run: false,
@@ -605,6 +871,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         }
     }
 
@@ -640,10 +908,10 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200)).expect(if malformed { 0 } else { 1 }).mount(&server).await;
             let repo = TempRepo::new();
             let mut ctx = test_context(repo.path().to_path_buf(), "v2", "v1");
-            ctx.github_client = Some(
-                github::GitHubClient::with_base_url("token".into(), "test/repo", server.uri())
+            ctx.github_client = Some(Box::new(
+                github::GitHubProvider::with_base_url("token".into(), "test/repo", server.uri())
                     .unwrap(),
-            );
+            ));
             let mut opts = test_opts("v2");
             opts.github_release = true;
             opts.workflow.preserve_sections = true;
@@ -697,10 +965,10 @@ mod tests {
             let mut ctx = test_context(repo.path().to_path_buf(), "v2.0.0", "v1.0.0");
             ctx.client = Box::new(client);
             ctx.workflow.preserve_sections = true;
-            ctx.github_client = Some(
-                github::GitHubClient::with_base_url("token".into(), "test/repo", server.uri())
+            ctx.github_client = Some(Box::new(
+                github::GitHubProvider::with_base_url("token".into(), "test/repo", server.uri())
                     .unwrap(),
-            );
+            ));
             let job = Arc::new(ProgressJobBuilder::new().build());
             let result = generate_notes(&ctx, true, true, true, &job).await;
             let prompts = prompts.lock().unwrap();
@@ -777,15 +1045,17 @@ mod tests {
             .await;
         let repo = TempRepo::new();
         let mut ctx = test_context(repo.path().to_path_buf(), "v2", "v1");
-        ctx.github_client = Some(
-            github::GitHubClient::with_base_url("token".into(), "test/repo", server.uri()).unwrap(),
-        );
+        ctx.github_client = Some(Box::new(
+            github::GitHubProvider::with_base_url("token".into(), "test/repo", server.uri())
+                .unwrap(),
+        ));
         ctx.rules.include_labels = vec!["keep".into()];
         ctx.rules.exclude_labels = vec!["skip".into()];
         ctx.rules.categories.insert("bug".into(), "Fixed".into());
         let (log, excluded, guidance) = apply_rules(
             &ctx,
             "abc Internal (#1)\ndef Important (#2)\nghi Followup (#2)",
+            &CommitMrs::new(),
         )
         .await
         .unwrap();
@@ -795,7 +1065,11 @@ mod tests {
         assert!(guidance.contains("def MUST appear"));
         assert!(guidance.contains("under Fixed"));
         ctx.github_client = None;
-        assert!(apply_rules(&ctx, "abc (#1)").await.is_err());
+        assert!(
+            apply_rules(&ctx, "abc (#1)", &CommitMrs::new())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -835,6 +1109,7 @@ mod tests {
     fn test_validate_generate_options_rejects_head_github_release() {
         let opts = GenerateOptions {
             github_release: true,
+            gitlab_release: false,
             ..test_opts("HEAD")
         };
 
@@ -921,6 +1196,7 @@ mod tests {
     async fn test_run_rejects_head_github_release_before_context() {
         let opts = GenerateOptions {
             github_release: true,
+            gitlab_release: false,
             config: Some(PathBuf::from(
                 "/tmp/communique-missing-config-for-validation.toml",
             )),
@@ -998,6 +1274,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -1043,6 +1321,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -1082,7 +1362,7 @@ mod tests {
             .await;
 
         let gh =
-            github::GitHubClient::with_base_url("test-token".into(), "test/repo", server.uri())
+            github::GitHubProvider::with_base_url("test-token".into(), "test/repo", server.uri())
                 .unwrap();
 
         let mock_client = MockLlmClient::new(vec![TurnResponse {
@@ -1107,7 +1387,9 @@ mod tests {
             },
             system_extra: Some("Extra instructions".into()),
             context: Some("Test project".into()),
-            github_client: Some(gh),
+            github_client: Some(Box::new(gh)),
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -1134,7 +1416,7 @@ mod tests {
             .await;
 
         let gh =
-            github::GitHubClient::with_base_url("test-token".into(), "test/repo", server.uri())
+            github::GitHubProvider::with_base_url("test-token".into(), "test/repo", server.uri())
                 .unwrap();
 
         let ctx = Context {
@@ -1149,11 +1431,14 @@ mod tests {
             defaults: Defaults::default(),
             system_extra: None,
             context: None,
-            github_client: Some(gh),
+            github_client: Some(Box::new(gh)),
+            gitlab_url: None,
+            token_env: None,
         };
 
         let opts = GenerateOptions {
             github_release: true,
+            gitlab_release: false,
             dry_run: false,
             ..test_opts("v1.0.0")
         };
@@ -1186,10 +1471,13 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let opts = GenerateOptions {
             github_release: true,
+            gitlab_release: false,
             dry_run: true,
             ..test_opts("v1.0.0")
         };
@@ -1222,7 +1510,7 @@ mod tests {
             .await;
 
         let gh =
-            github::GitHubClient::with_base_url("test-token".into(), "test/repo", server.uri())
+            github::GitHubProvider::with_base_url("test-token".into(), "test/repo", server.uri())
                 .unwrap();
 
         let ctx = Context {
@@ -1237,11 +1525,14 @@ mod tests {
             defaults: Defaults::default(),
             system_extra: None,
             context: None,
-            github_client: Some(gh),
+            github_client: Some(Box::new(gh)),
+            gitlab_url: None,
+            token_env: None,
         };
 
         let opts = GenerateOptions {
             github_release: true,
+            gitlab_release: false,
             dry_run: false,
             ..test_opts("v1.0.0")
         };
@@ -1406,6 +1697,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -1491,6 +1784,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -1500,7 +1795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_e2e_with_github() {
+    async fn github_provider_preserves_agent_contract() {
         let repo = TempRepo::new();
         repo.write_file("README.md", "# Hello");
         repo.commit("initial");
@@ -1569,7 +1864,7 @@ mod tests {
             .await;
 
         let gh =
-            github::GitHubClient::with_base_url("test-token".into(), "test/repo", server.uri())
+            github::GitHubProvider::with_base_url("test-token".into(), "test/repo", server.uri())
                 .unwrap();
 
         let mock_client = MockLlmClient::new(vec![
@@ -1630,7 +1925,9 @@ mod tests {
             },
             system_extra: None,
             context: None,
-            github_client: Some(gh),
+            github_client: Some(Box::new(gh)),
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -1677,7 +1974,7 @@ mod tests {
             .await;
 
         let gh =
-            github::GitHubClient::with_base_url("test-token".into(), "test/repo", server.uri())
+            github::GitHubProvider::with_base_url("test-token".into(), "test/repo", server.uri())
                 .unwrap();
 
         let mock_client = MockLlmClient::new(vec![TurnResponse {
@@ -1706,11 +2003,14 @@ mod tests {
             },
             system_extra: None,
             context: None,
-            github_client: Some(gh),
+            github_client: Some(Box::new(gh)),
+            gitlab_url: None,
+            token_env: None,
         };
 
         let opts = GenerateOptions {
             github_release: true,
+            gitlab_release: false,
             dry_run: false,
             ..test_opts("v1.0.0")
         };
@@ -1772,6 +2072,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let job = Arc::new(ProgressJobBuilder::new().build());
@@ -2120,6 +2422,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let parsed = ParsedOutput {
@@ -2180,6 +2484,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let parsed = ParsedOutput {
@@ -2229,6 +2535,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let parsed = ParsedOutput {
@@ -2321,6 +2629,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let parsed = ParsedOutput {
@@ -2395,6 +2705,8 @@ mod tests {
             system_extra: None,
             context: None,
             github_client: None,
+            gitlab_url: None,
+            token_env: None,
         };
 
         let parsed = ParsedOutput {
@@ -2607,8 +2919,12 @@ fn header_version(line: &str) -> Option<&str> {
     let rest = rest.trim_start();
 
     if let Some(bracketed) = rest.strip_prefix('[') {
-        let (version, _) = bracketed.split_once(']')?;
-        return is_version_like(version).then_some(version);
+        let (version, suffix) = bracketed.split_once(']')?;
+        return (is_version_like(version)
+            || (!version.is_empty() && version.chars().all(|c| c.is_ascii_digit()))
+            || (suffix.starts_with('(')
+                && (suffix.contains("/-/releases/") || suffix.contains("/releases/tag/"))))
+        .then_some(version);
     }
 
     let version = rest
@@ -2943,10 +3259,13 @@ async fn update_changelog(
         .unwrap_or_else(|_| "# Changelog\n\n## [Unreleased]\n".to_string());
 
     let date = today_iso();
-    let release_url = format!(
-        "https://github.com/{}/releases/tag/{}",
-        ctx.owner_repo, ctx.tag
-    );
+    let release_url = match &ctx.gitlab_url {
+        Some(url) => format!("{url}/-/releases/{}", ctx.tag),
+        None => format!(
+            "https://github.com/{}/releases/tag/{}",
+            ctx.owner_repo, ctx.tag
+        ),
+    };
 
     let content =
         upsert_version_changelog(&existing, &ctx.tag, &date, &release_url, &parsed.changelog)?;
@@ -2958,9 +3277,32 @@ async fn update_changelog(
     Ok(())
 }
 
+fn github_pr_numbers(ctx: &Context, log: &str) -> Vec<u64> {
+    if ctx.gitlab_url.is_some() {
+        vec![]
+    } else {
+        git::extract_pr_numbers(log)
+    }
+}
+
+async fn rule_pull_requests(
+    ctx: &Context,
+    log: &str,
+    provider: &dyn crate::git_provider::GitProvider,
+) -> miette::Result<std::collections::BTreeMap<u64, crate::git_provider::PullRequest>> {
+    let mut prs = std::collections::BTreeMap::new();
+    for number in github_pr_numbers(ctx, log) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = prs.entry(number) {
+            entry.insert(provider.get_pr(number).await?);
+        }
+    }
+    Ok(prs)
+}
+
 async fn apply_rules(
     ctx: &Context,
     log: &str,
+    commit_mrs: &CommitMrs,
 ) -> miette::Result<(String, Vec<crate::workflow::Coverage>, String)> {
     let rules = &ctx.rules;
     let active = !rules.include_labels.is_empty()
@@ -2969,23 +3311,23 @@ async fn apply_rules(
     if !active {
         return Ok((log.into(), vec![], String::new()));
     }
+    if ctx.gitlab_url.is_some() && ctx.github_client.is_none() {
+        return Ok((log.into(), vec![], String::new()));
+    }
     let gh = ctx.github_client.as_ref().ok_or_else(|| {
         miette::miette!("GITHUB_TOKEN is required to apply configured label rules")
     })?;
-    let mut prs = std::collections::BTreeMap::new();
-    for number in git::extract_pr_numbers(log) {
-        if let std::collections::btree_map::Entry::Vacant(entry) = prs.entry(number) {
-            entry.insert(gh.get_pr(number).await?);
-        }
-    }
+    let prs = rule_pull_requests(ctx, log, gh.as_ref()).await?;
     let mut kept = Vec::new();
     let mut excluded = Vec::new();
     let mut guidance = String::new();
     for line in log.lines() {
-        let numbers = git::extract_pr_numbers(line);
+        let numbers = github_pr_numbers(ctx, line);
+        let sha = line.split_whitespace().next().unwrap_or_default();
         let labels: Vec<_> = numbers
             .iter()
             .filter_map(|n| prs.get(n))
+            .chain(commit_mrs.get(sha).into_iter().flatten())
             .flat_map(|pr| pr.labels.iter().map(|l| l.name.as_str()))
             .collect();
         let include = rules

@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::github::GitHubClient;
+use crate::git_provider::GitProvider;
 use crate::llm::ToolDefinition;
 
 pub fn definition() -> ToolDefinition {
@@ -21,7 +21,7 @@ pub fn definition() -> ToolDefinition {
     }
 }
 
-pub async fn execute(github: &GitHubClient, input: &serde_json::Value) -> Result<String> {
+pub async fn execute(github: &dyn GitProvider, input: &serde_json::Value) -> Result<String> {
     let number = input["number"]
         .as_u64()
         .ok_or_else(|| Error::Tool("get_pr: missing 'number' parameter".into()))?;

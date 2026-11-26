@@ -4,7 +4,9 @@ mod config;
 mod error;
 mod generate;
 mod git;
+mod git_provider;
 mod github;
+mod gitlab;
 mod links;
 mod llm;
 mod output;
@@ -49,7 +51,14 @@ async fn main() -> miette::Result<()> {
         clx::progress::set_output(clx::progress::ProgressOutput::Text);
     }
 
-    let result = match cli.command {
+    let result = run_command(cli).await;
+
+    clx::progress::flush();
+    result
+}
+
+async fn run_command(cli: Cli) -> miette::Result<()> {
+    match cli.command {
         Command::Completion { shell } => {
             let shell = usage_rs::complete::Shell::from_name(&shell)
                 .ok_or_else(|| miette::miette!("unsupported shell: {shell}"))?;
@@ -58,14 +67,26 @@ async fn main() -> miette::Result<()> {
         }
         Command::Usage(usage) => usage.run(),
         Command::Sponsors => sponsors(),
-        Command::Publish { draft, dry_run } => workflow::publish_draft(&draft, dry_run).await,
+        Command::Publish { draft, dry_run } => {
+            workflow::publish_draft(&draft, dry_run, cli.config.as_deref()).await
+        }
         Command::Init(init_args) => init(init_args.force),
         Command::Generate(g) => {
             generate::run(generate::GenerateOptions {
-                tag: g.tag,
+                tag: g
+                    .tag
+                    .or_else(|| {
+                        std::env::var("CI_COMMIT_TAG")
+                            .ok()
+                            .filter(|tag| !tag.is_empty())
+                    })
+                    .ok_or_else(|| {
+                        miette::miette!("a target ref is required (or set CI_COMMIT_TAG)")
+                    })?,
                 workflow: g.workflow,
                 prev_tag: g.prev_tag,
                 github_release: g.github_release,
+                gitlab_release: g.gitlab_release,
                 changelog: g.changelog,
                 concise: g.concise,
                 dry_run: g.dry_run,
@@ -80,10 +101,7 @@ async fn main() -> miette::Result<()> {
             })
             .await
         }
-    };
-
-    clx::progress::flush();
-    result
+    }
 }
 
 fn init(force: bool) -> miette::Result<()> {

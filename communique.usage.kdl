@@ -50,6 +50,7 @@ cmd completion help="Generate a self-contained shell completion script" effect=r
 cmd generate help="Generate release notes for a git tag" effect=read {
     use workflow-options
     flag --github-release help="Push editorialized notes to the GitHub release" effect=write conflicts=--draft
+    flag --gitlab-release help="Create or update a GitLab release" effect=write conflicts=--draft
     flag --changelog help="Update CHANGELOG.md with the generated changelog entry" effect=write
     flag --concise help="Output concise changelog entry instead of detailed notes"
     flag "-n --dry-run" help="Generate notes without updating GitHub or verifying links"
@@ -75,7 +76,7 @@ cmd generate help="Generate release notes for a git tag" effect=read {
         arg <OUTPUT>
     }
     flag "-h --help" help="Print help" action=help builtin=#true
-    arg <TAG> help="Git tag to generate release notes for"
+    arg "[TAG]" help="Target git ref (defaults to CI_COMMIT_TAG)"
     arg "[PREV_TAG]" help="Previous tag (auto-detected if omitted)"
 }
 cmd publish help="Publish an edited JSON draft without invoking an LLM" effect=write {

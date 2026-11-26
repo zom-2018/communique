@@ -3,6 +3,88 @@ use std::process::Command;
 
 use serde_json::json;
 
+async fn gitlab_identification_mock() -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": null, "tool_calls": [{"id": "1", "type": "function", "function": {"name": "submit_release_notes", "arguments": "{\"changelog\":\"Changes\",\"release_title\":\"Release\",\"release_body\":\"Changes\"}"}}]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&server).await;
+    server
+}
+
+fn gitlab_identification_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init"]);
+    git(repo, &["config", "user.email", "test@example.com"]);
+    git(repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("README"), "initial").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "initial"]);
+    git(repo, &["tag", "v1"]);
+    std::fs::write(repo.join("README"), "changed").unwrap();
+    git(repo, &["commit", "-am", "change"]);
+    git(repo, &["tag", "v2"]);
+    dir
+}
+
+#[tokio::test]
+async fn gitlab_remote_and_ci_identification() {
+    let server = gitlab_identification_mock().await;
+    for (remote, ci) in [
+        ("https://gitlab.example.com/group/sub/project.git", false),
+        ("git@gitlab.example.com:group/sub/project.git", false),
+        ("git@code.example.com:other/repo.git", true),
+    ] {
+        let dir = gitlab_identification_repo();
+        let repo = dir.path();
+        git(repo, &["remote", "add", "origin", remote]);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_communique"));
+        cmd.current_dir(repo)
+            .args([
+                "generate",
+                "v2",
+                "v1",
+                "--dry-run",
+                "--provider",
+                "openai",
+                "--model",
+                "test",
+                "--base-url",
+                &server.uri(),
+                "--output",
+                "out.md",
+            ])
+            .env("OPENAI_API_KEY", "test")
+            .env("CLX_NO_PROGRESS", "1")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("CI_SERVER_URL")
+            .env_remove("CI_PROJECT_PATH");
+        if ci {
+            cmd.env("CI_SERVER_URL", "https://code.example.com")
+                .env("CI_PROJECT_PATH", "group/sub/project");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "remote {remote}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::read_to_string(repo.join("out.md"))
+                .unwrap()
+                .contains("Changes")
+        );
+        let requests = server.received_requests().await.unwrap();
+        let request = requests.last().unwrap();
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(body.contains("group/sub/project"), "{body}");
+    }
+}
+
 #[test]
 fn test_native_completions_without_project_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -435,4 +517,94 @@ fn git(dir: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test]
+async fn github_agent_and_draft_safety_net() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let server = wiremock::MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let turn = calls.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(move |_: &wiremock::Request| {
+            let tools = if turn.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![
+                    json!({"id":"pr", "type":"function", "function":{"name":"get_pr", "arguments":"{\"number\":42}"}}),
+                    json!({"id":"diff", "type":"function", "function":{"name":"get_pr_diff", "arguments":"{\"number\":42}"}}),
+                    json!({"id":"issue", "type":"function", "function":{"name":"get_issue", "arguments":"{\"number\":7}"}}),
+                ]
+            } else {
+                vec![json!({"id":"submit", "type":"function", "function":{"name":"submit_release_notes", "arguments":json!({"release_title":"Safety release", "release_body":"Reviewed release body.", "changelog":"### Added\n- Safety feature"}).to_string()}})]
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "choices":[{"message":{"content":null,"tool_calls":tools},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":10}
+            }))
+        }).mount(&server).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init"]);
+    git(repo, &["config", "user.email", "test@test.com"]);
+    git(repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("file"), "old").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "initial"]);
+    git(repo, &["tag", "v1.0.0"]);
+    std::fs::write(repo.join("file"), "new").unwrap();
+    git(repo, &["commit", "-am", "feature"]);
+    git(repo, &["tag", "v2.0.0"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_communique"))
+        .current_dir(repo)
+        .args([
+            "generate",
+            "v2.0.0",
+            "v1.0.0",
+            "--repo",
+            "owner/repo",
+            "--provider",
+            "openai",
+            "--model",
+            "test",
+            "--base-url",
+            &server.uri(),
+            "--dry-run",
+            "--draft",
+            "draft.json",
+        ])
+        .env("OPENAI_API_KEY", "test")
+        .env("CLX_NO_PROGRESS", "1")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let request: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let messages = request["messages"].as_array().unwrap();
+    for (id, expected) in [
+        ("pr", "get_pr requires GITHUB_TOKEN to be set"),
+        ("diff", "get_pr_diff requires GITHUB_TOKEN to be set"),
+        ("issue", "get_issue requires GITHUB_TOKEN to be set"),
+    ] {
+        let result = messages.iter().find(|m| m["tool_call_id"] == id).unwrap();
+        assert!(
+            result["content"].as_str().unwrap().contains(expected),
+            "{result}"
+        );
+    }
+    let draft: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.join("draft.json")).unwrap()).unwrap();
+    assert_eq!(draft["repo"], "owner/repo");
+    assert_eq!(draft["tag"], "v2.0.0");
+    assert_eq!(draft["previous_ref"], "v1.0.0");
+    assert_eq!(draft["release_body"], "Reviewed release body.");
 }

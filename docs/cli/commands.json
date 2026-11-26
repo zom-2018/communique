@@ -56,15 +56,15 @@
         "full_cmd": [
           "generate"
         ],
-        "usage": "generate [FLAGS] <TAG> [PREV_TAG]",
+        "usage": "generate [FLAGS] [TAG] [PREV_TAG]",
         "subcommands": {},
         "args": [
           {
             "name": "TAG",
-            "usage": "<TAG>",
-            "help": "Git tag to generate release notes for",
-            "help_first_line": "Git tag to generate release notes for",
-            "required": true,
+            "usage": "[TAG]",
+            "help": "Target git ref (defaults to CI_COMMIT_TAG)",
+            "help_first_line": "Target git ref (defaults to CI_COMMIT_TAG)",
+            "required": false,
             "double_dash": "Optional",
             "hide": false
           },
@@ -261,6 +261,22 @@
             "short": [],
             "long": [
               "github-release"
+            ],
+            "hide": false,
+            "global": false,
+            "conflicts": [
+              "--draft"
+            ],
+            "effect": "write"
+          },
+          {
+            "name": "gitlab-release",
+            "usage": "--gitlab-release",
+            "help": "Create or update a GitLab release",
+            "help_first_line": "Create or update a GitLab release",
+            "short": [],
+            "long": [
+              "gitlab-release"
             ],
             "hide": false,
             "global": false,

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
 
-use crate::{github::GitHubClient, output::ParsedOutput};
+use crate::{github::GitHubProvider, output::ParsedOutput};
 
 #[derive(Debug, Default, Clone, usage_rs::Args)]
 pub struct WorkflowOptions {
@@ -172,6 +172,8 @@ impl Review {
 pub struct Draft {
     pub schema_version: u32,
     pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gitlab_project_url: Option<String>,
     pub tag: String,
     pub previous_ref: String,
     pub target_commit: String,
@@ -194,6 +196,7 @@ impl Draft {
         Self {
             schema_version: 1,
             repo: repo.into(),
+            gitlab_project_url: None,
             tag: tag.into(),
             previous_ref: previous_ref.into(),
             target_commit: target_commit.into(),
@@ -237,9 +240,11 @@ impl Draft {
             ));
         }
         let parts: Vec<_> = self.repo.split('/').collect();
-        if parts.len() != 2
+        if parts.len() < 2
             || parts.iter().any(|p| {
                 p.is_empty()
+                    || *p == "."
+                    || *p == ".."
                     || !p
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
@@ -295,7 +300,11 @@ pub fn merge_body(existing: &str, generated: &str) -> miette::Result<String> {
     }
 }
 
-pub async fn publish_draft(path: &Path, dry_run: bool) -> miette::Result<()> {
+pub async fn publish_draft(
+    path: &Path,
+    dry_run: bool,
+    config_path: Option<&Path>,
+) -> miette::Result<()> {
     let draft: Draft = serde_json::from_str(&std::fs::read_to_string(path).into_diagnostic()?)
         .into_diagnostic()?;
     draft.validate()?;
@@ -303,14 +312,48 @@ pub async fn publish_draft(path: &Path, dry_run: bool) -> miette::Result<()> {
         println!("# {}\n\n{}", draft.release_title, draft.release_body);
         return Ok(());
     }
+    if draft.gitlab_project_url.is_some() {
+        let root = crate::git::repo_root()?;
+        let config = match config_path {
+            Some(path) => crate::config::Config::load_from(path)?,
+            None => crate::config::Config::load(&root)?,
+        }
+        .unwrap_or_default();
+        let project = crate::git::detect_project(&root, None, config.git.as_ref())?;
+        if project.provider == crate::git::ProjectProvider::GitLab {
+            if project.path != draft.repo
+                || draft.gitlab_project_url.as_deref()
+                    != Some(format!("{}/{}", project.web_url, project.path).as_str())
+            {
+                return Err(miette::miette!(
+                    "Draft project does not match the current GitLab project"
+                ));
+            }
+            let client =
+                crate::git_provider::gitlab_provider(&project, true)?.ok_or_else(|| {
+                    miette::miette!(
+                        "{} is required to read or update the release",
+                        crate::git_provider::gitlab_token_name(&project)
+                    )
+                })?;
+            return publish_with_client(draft, dry_run, client.as_ref()).await;
+        }
+        return Err(miette::miette!(
+            "GitLab draft requires the matching configured GitLab project"
+        ));
+    }
     let token = std::env::var("GITHUB_TOKEN")
         .into_diagnostic()
         .map_err(|_| miette::miette!("GITHUB_TOKEN is required to read or update the release"))?;
-    let gh = GitHubClient::new(token, &draft.repo)?;
+    let gh = GitHubProvider::new(token, &draft.repo)?;
     publish_with_client(draft, dry_run, &gh).await
 }
 
-async fn publish_with_client(draft: Draft, dry_run: bool, gh: &GitHubClient) -> miette::Result<()> {
+async fn publish_with_client(
+    draft: Draft,
+    dry_run: bool,
+    gh: &dyn crate::git_provider::GitProvider,
+) -> miette::Result<()> {
     draft.validate()?;
     let release = gh
         .get_release_by_tag(&draft.tag)
@@ -388,7 +431,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let gh =
-                GitHubClient::with_base_url("token".into(), "owner/repo", server.uri()).unwrap();
+                GitHubProvider::with_base_url("token".into(), "owner/repo", server.uri()).unwrap();
             let notes = ParsedOutput {
                 changelog: "Change".into(),
                 release_title: "Title".into(),
@@ -481,7 +524,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let gh = GitHubClient::with_base_url("token".into(), "owner/repo", server.uri()).unwrap();
+        let gh = GitHubProvider::with_base_url("token".into(), "owner/repo", server.uri()).unwrap();
         let notes = ParsedOutput {
             changelog: "Change".into(),
             release_title: "Edited title".into(),
@@ -550,7 +593,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let gh = GitHubClient::with_base_url("token".into(), "owner/repo", server.uri()).unwrap();
+        let gh = GitHubProvider::with_base_url("token".into(), "owner/repo", server.uri()).unwrap();
         let notes = ParsedOutput {
             changelog: "Change".into(),
             release_title: "Generated title".into(),
